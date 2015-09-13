@@ -24,19 +24,19 @@
 
 
 namespace lr {
-
+    
 
 /// This class is a compact driver for the LS013B4DN04 display from Sharp.
 ///
 /// The driver uses fixed 8x8 pixel characters to show text on the display.
 /// You can use special characters to draw simple boxes and lines.
 ///
-/// This version of the driver uses timer 2 to auto refresh the display. You
-/// can choose a normal (0.2s) or slow (1s) refresh rate.
-///
 /// See http://luckyresistor.me for details.
 ///
 /// You can buy the display from Adafruit: http://www.adafruit.com/products/1393
+///
+/// There can only be one instance of this class, it is using global variables
+/// to reduce any overhead.
 ///
 class SharpDisplay
 {
@@ -53,9 +53,13 @@ public:
     /// The refresh interval
     ///
     enum RefreshInterval {
-        NormalRefresh, ///< Refresh every ~200ms
+        NormalRefresh, ///< Refresh every ~100ms
         SlowRefresh, ///< Refresh every second.
     };
+    
+    /// The type for the interrupt callback.
+    ///
+    typedef void (*InterruptCallback)();
     
 public:
     /// Create a new instance of the sharp display driver.
@@ -82,6 +86,10 @@ public:
     /// Change the refresh interval
     ///
     void setRefreshInterval(RefreshInterval refreshInterval);
+    
+    /// Set a function which is called for each interrupt.
+    ///
+    void setInterruptCallback(InterruptCallback interruptCallback);
     
     /// Set the font for the display.
     ///
@@ -150,6 +158,14 @@ public:
     /// @param text The text to write in the row.
     ///
     void setLineText(uint8_t row, const String &text);
+    
+    /// Set the text for a single line using null terminated text from flash memory.
+    ///
+    void setLineText(uint8_t row, const char *prgMemText);
+    
+    /// Fill a row with the given character.
+    ///
+    void fillRow(uint8_t row, char c);
     
     /// Set the inversion state of a row
     ///

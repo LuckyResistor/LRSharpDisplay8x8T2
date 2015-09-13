@@ -24,8 +24,8 @@
 #include <avr/interrupt.h>
 
 
-// Global counters for the interrupt.
 namespace lr {
+// An anonymous namespace to prevent name conflicts.
 namespace {
     
     
@@ -33,33 +33,12 @@ namespace {
 static uint8_t gDisplayRefreshCounter;
 static uint8_t gDisplayRefreshTrigger;
 
+// This counter is used to protect the display from stuck pixels.
+static uint32_t gDisplayProtectCounter;
+static const uint32_t gDisplayProtectTrigger = 0x6B3A0; // Approximate after 2h
     
-// Forward declaration of the refreshDisplayt method
-void refreshDisplay();
-    
-
-}
-}
-
-
-// Create an interrupt for timer2 overflow.
-// This interrupt will automatically refresh the display.
-ISR(TIMER2_OVF_vect)
-{
-    ++lr::gDisplayRefreshCounter;
-    if (lr::gDisplayRefreshCounter > lr::gDisplayRefreshTrigger) {
-        lr::gDisplayRefreshCounter = 0;
-        lr::refreshDisplay();
-    }
-}
-
-
-namespace lr {
-
-
-// An anonymous namespace to prevent name conflicts.
-namespace {
-
+// A callback for the interrupt
+static SharpDisplay::InterruptCallback gInterruptCallback;
     
 // Use a number of global variables for time critical parts
 // The following variables are used for the communication.
@@ -218,7 +197,6 @@ inline void clearScreenUpdate()
     memset(gScreenRowRequiresUpdate, 0x00, gScreenRowRequiresUpdateSize);
 }
 
-
 // A simple class to lock the interrupt and make sure it is enabled if
 // the method ends.
 class LockInterrupt {
@@ -262,14 +240,53 @@ void refreshDisplay()
     }
     sendByteLSB(0x00);
     digitalWrite(gChipSelectPin, LOW);
+    clearScreenUpdate();
 }
+
     
+void refreshFullDisplay(bool invert)
+{
+    // Send the write command.
+    digitalWrite(gChipSelectPin, HIGH);
+    sendByteMSB(CMD_WRITE|gVComBit);
+    toggleVComBit();
+    // Update all rows which need a refresh.
+    for (uint8_t row = 0; row < gScreenHeight; ++row) {
+        // Draw the row pixel row by pixel row
+        for (uint8_t pixelRow = 0; pixelRow < gCharacterHeight; ++pixelRow) {
+            sendByteLSB(row*gCharacterHeight+pixelRow+1);
+            for (uint8_t column = 0; column < gScreenWidth; ++column) {
+                const uint8_t screenData = *(getCharacterPosition(row, column));
+                const uint8_t characterIndex = (screenData & gTextCharacterMask);
+                uint16_t characterStart = characterIndex;
+                characterStart *= gCharacterHeight;
+                characterStart += pixelRow;
+                uint8_t pixelMask = pgm_read_byte(gTextFont+characterStart);
+                if ((screenData & gTextFlagInverse) != 0) { // Inverse character?
+                    pixelMask = ~pixelMask;
+                }
+                if (invert) {
+                    pixelMask = ~pixelMask;
+                }
+                sendByteMSB(pixelMask);
+            }
+            sendByteLSB(0x00);
+        }
+    }
+    sendByteLSB(0x00);
+    digitalWrite(gChipSelectPin, LOW);
+    clearScreenUpdate();
+}
+
     
 inline void fastSetCharacter(uint8_t row, uint8_t column, uint8_t character)
 {
     uint8_t* const cp = getCharacterPosition(row, column);
-    *cp = ((static_cast<uint8_t>(character)-0x20) & gTextCharacterMask) | gTextFlags;
-    markRowForUpdate(row);
+    const uint8_t newChar = ((static_cast<uint8_t>(character)-0x20) & gTextCharacterMask) | gTextFlags;
+    if (*cp != newChar) {
+        *cp = newChar;
+        markRowForUpdate(row);
+    }
 }
 
 
@@ -333,9 +350,55 @@ inline void fastWriteCharacter(uint8_t c)
 }
 
 
+} // end of anonymous namespace
+} // end of lr namespace
+
+
+// Create an interrupt for timer2 overflow.
+// This interrupt will automatically refresh the display.
+ISR(TIMER2_OVF_vect)
+{
+    // Check the protect counter, this counter will make sure the
+    // whole display is refreshed and inverted every two hours
+    // to prevent any stuck pixels.
+    bool refreshDone = false;
+    ++lr::gDisplayProtectCounter;
+    if (lr::gDisplayProtectCounter >= (lr::gDisplayProtectTrigger+0x80)) {
+        lr::gDisplayProtectCounter = 0;
+        lr::markScreenForUpdate();
+    } else if (lr::gDisplayProtectCounter >= (lr::gDisplayProtectTrigger+0x40)) {
+        // Refresh the whole display, back normal.
+        if ((lr::gDisplayProtectCounter&7) == 0) {
+            lr::refreshFullDisplay(false);
+        }
+        refreshDone = true;
+    } else if (lr::gDisplayProtectCounter >= lr::gDisplayProtectTrigger) {
+        // Refresh the whole display, inverse.
+        if ((lr::gDisplayProtectCounter&7) == 0) {
+            lr::refreshFullDisplay(true);
+        }
+        refreshDone = true;
+    }
+    
+    // The regular display refresh count.
+    ++lr::gDisplayRefreshCounter;
+    if (lr::gDisplayRefreshCounter > lr::gDisplayRefreshTrigger) {
+        lr::gDisplayRefreshCounter = 0;
+        if (!refreshDone) {
+            lr::refreshDisplay();
+        }
+    }
+    
+    // Check if there is a interrupt callback.
+    if (lr::gInterruptCallback != 0) {
+        lr::gInterruptCallback();
+    }
 }
 
 
+namespace lr {
+
+    
 SharpDisplay::SharpDisplay(uint8_t chipSelectPin, uint8_t clockPin, uint8_t dataPin)
 {
     // Prepare the values for the SPI communication
@@ -357,7 +420,11 @@ SharpDisplay::SharpDisplay(uint8_t chipSelectPin, uint8_t clockPin, uint8_t data
     
     // Initialize the counter.
     gDisplayRefreshCounter = 0;
-    gDisplayRefreshTrigger = 12; // ~200ms
+    gDisplayRefreshTrigger = 6; // ~100ms
+    gDisplayProtectCounter = 0;
+    
+    // No interrupt callback.
+    gInterruptCallback = 0;
 }
 
     
@@ -394,13 +461,19 @@ void SharpDisplay::setRefreshInterval(RefreshInterval refreshInterval)
 {
     LockInterrupt lock;
     if (refreshInterval == NormalRefresh) {
-        gDisplayRefreshTrigger = 12;
+        gDisplayRefreshTrigger = 6;
     } else {
         gDisplayRefreshTrigger = 61;
     }
     gDisplayRefreshCounter = 0;
 }
     
+    
+void SharpDisplay::setInterruptCallback(InterruptCallback interruptCallback)
+{
+    gInterruptCallback = interruptCallback;
+}
+
     
 void SharpDisplay::setFont(const uint8_t *fontData)
 {
@@ -474,7 +547,35 @@ void SharpDisplay::setLineText(uint8_t row, const String &text)
         markRowForUpdate(row);
     }
 }
+
     
+void SharpDisplay::setLineText(uint8_t row, const char *prgMemText)
+{
+    LockInterrupt lock;
+    if (row < gScreenHeight) {
+        const uint8_t length = strlen_P(prgMemText);
+        for (uint8_t column = 0; column < gScreenWidth; ++column) {
+            if (column < length) {
+                fastSetCharacter(row, column, pgm_read_byte(prgMemText + column));
+            } else {
+                fastSetCharacter(row, column, ' ');
+            }
+        }
+        markRowForUpdate(row);
+    }
+}
+    
+    
+void SharpDisplay::fillRow(uint8_t row, char c)
+{
+    LockInterrupt lock;
+    if (row < gScreenHeight) {
+        for (uint8_t column = 0; column < gScreenWidth; ++column) {
+            fastSetCharacter(row, column, c);
+        }
+    }
+}
+
     
 void SharpDisplay::setLineInverted(uint8_t row, bool inverted)
 {
